@@ -256,13 +256,12 @@ impl Table {
                 continue;
             }
             self.shadowed_by_va.remove(&(sva, sres));
-            if let Some(mut e) = self.shadowed.remove(&sres) {
+            if let Some(e) = self.shadowed.remove(&sres) {
+                // its memory is mapped again by the caller, which then decides whether it is
+                // uploaded (`forget`); until then it stays `unmapped`, so no refresh uploads it
+                // into memory that may be another texture's now
                 if e.unmapped {
-                    e.unmapped = false;
                     to_remap.push(sres);
-                    if !e.gpu_written {
-                        e.pending = true;
-                    }
                 }
                 if e.pending {
                     pending_delta += 1;
@@ -506,8 +505,37 @@ pub fn forget(res: usize) {
         (removed, unsafe { clone_resources(&remap_ptrs) })
     };
     for r in &to_remap {
-        unsafe {
-            super::vram::remap_if_unmapped(r);
+        use super::vram::Remap;
+        let done = unsafe { super::vram::remap_if_unmapped(r) };
+        let key = r.as_raw() as usize;
+        let mut t = TEXTURES.lock().unwrap();
+        let active = t.by_res.contains_key(&key);
+        // (None: retired meanwhile; not active: shadowed again by a newer texture over its
+        // memory) – memory mapped for it goes back
+        let give_back = match t.get_mut(key) {
+            Some(e) if active && e.unmapped => {
+                e.unmapped = false;
+                if done == Remap::RunTaken {
+                    // its memory went to another one meanwhile (`vram::place_in_blocks`: it stays
+                    // placed there): not uploaded over that one
+                    if e.pending {
+                        e.pending = false;
+                        PENDING.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    e.gpu_written = true;
+                } else if !e.pending && !e.gpu_written {
+                    // (one that could not be mapped now is uploaded once it is)
+                    e.pending = true;
+                    PENDING.fetch_add(1, Ordering::Relaxed);
+                }
+                false
+            }
+            Some(_) => !active && done == Remap::Mapped,
+            None => done == Remap::Mapped,
+        };
+        drop(t);
+        if give_back {
+            unsafe { super::vram::unmap_superseded(r) };
         }
     }
     if removed {
@@ -756,16 +784,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
         let mut t = TEXTURES.lock().unwrap();
         t.by_res
             .iter_mut()
-            .filter(|(_, e)| {
-                if e.pending {
-                    return true;
-                }
-                if e.gpu_written {
-                    return false;
-                }
-                let i = dirty.partition_point(|&p| p + page as usize <= e.src);
-                dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
-            })
+            .filter(|(_, e)| wants_upload(e, &dirty, page as usize))
             .filter_map(|(&res, e)| {
                 if e.pending {
                     e.pending = false;
@@ -777,6 +796,23 @@ unsafe fn refresh_once(queue: *mut c_void) {
             .collect()
     });
     upload_all(todo);
+}
+
+/// Whether a texture is uploaded at this refresh (`dirty`: the written pages, sorted): one made
+/// since the last submit, or one with a written page – not one the GPU wrote, and not one
+/// uncovered whose memory is not mapped again yet (`forget`).
+fn wants_upload(e: &Entry, dirty: &[usize], page: usize) -> bool {
+    if e.unmapped {
+        return false;
+    }
+    if e.pending {
+        return true;
+    }
+    if e.gpu_written {
+        return false;
+    }
+    let i = dirty.partition_point(|&p| p + page <= e.src);
+    dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
 }
 
 /// texture → `content_hash` of its memory at its last upload
@@ -793,6 +829,12 @@ fn unchanged_skip() -> bool {
 /// content from here on (the caller uploads it when this is false).
 fn same_as_last_upload(res: usize, h: u64) -> bool {
     LAST_CONTENT.lock().unwrap().insert(res, h) == Some(h)
+}
+
+/// `res` got its block-heap run back, which may hold another texture's texels now, so its next
+/// upload must not be left out as unchanged.
+pub(super) fn forget_content(res: usize) {
+    LAST_CONTENT.lock().unwrap().remove(&res);
 }
 
 /// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
@@ -1219,6 +1261,163 @@ mod tests {
         forget(b);
     }
 
+    /// A texture superseded by one over part of its memory gives its block-heap run back; uncovered
+    /// after another texture took that run, it is not uploaded (it would write over the other).
+    #[test]
+    fn an_uncovered_texture_whose_run_went_to_another_is_not_uploaded() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        unsafe {
+            let dev = super::super::real::device_raw();
+            // 512 x 512 R8: 256 KiB
+            let pc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 512, Height: 512, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+            let console = console_desc(3, 512, 512, 1, 1, DXGI_FORMAT_R8_UNORM.0 as u32, 1);
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_at = |va: usize| {
+                let mut p = std::ptr::null_mut();
+                let hr = super::super::vram::place_pages(dev, va, &pc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(512 * 512), riid, &mut p);
+                (hr.is_some_and(|hr| hr >= 0) && !p.is_null()).then(|| ID3D12Resource::from_raw(p))
+            };
+            let va = 0x64_0000_3000usize;
+            let Some(a) = place_at(va) else { return crate::gpu::recomp::runner::skip_test("no block heaps") };
+            let Some(run) = super::super::vram::block_run_of(a.as_raw() as usize) else { return crate::gpu::recomp::runner::skip_test("no block heaps") };
+            register(dev, a.as_raw(), va, &console, D3D12_RESOURCE_STATE_COMMON).unwrap();
+            // b over the second half of a: a is superseded and gives its run back
+            let b = place_at(va + 0x2_0000).unwrap();
+            register(dev, b.as_raw(), va + 0x2_0000, &console, D3D12_RESOURCE_STATE_COMMON).unwrap();
+            // once cooled, a texture elsewhere of a's size takes that run
+            super::super::vram::cool_blocks_for_test();
+            let c = place_at(0x65_0000_3000).unwrap();
+            assert_eq!(super::super::vram::block_run_of(c.as_raw() as usize), Some(run), "the cooled run went to c");
+            let (ka, kb) = (a.as_raw() as usize, b.as_raw() as usize);
+            // b released, in the order `real.rs` does it
+            super::super::vram::forget(kb);
+            forget(kb);
+            let t = TEXTURES.lock().unwrap();
+            let e = t.by_res.get(&ka).expect("a is active again");
+            assert!(!e.pending && e.gpu_written && !e.unmapped, "a is not uploaded over c");
+            assert!(!wants_upload(e, &[va], 0x1_0000), "not even when its memory is written");
+            drop(t);
+            assert_eq!(super::super::vram::block_run_of(ka), None, "a does not hold c's run");
+            assert_eq!(super::super::vram::block_run_of(c.as_raw() as usize), Some(run), "c keeps it");
+            for r in [&a, &b, &c] {
+                forget(r.as_raw() as usize);
+                super::super::vram::forget(r.as_raw() as usize);
+            }
+        }
+    }
+
+    /// A texture superseded gives its block-heap run back; another texture takes the run and gives
+    /// it back again before the first is uncovered: the first holds its run again, and its memory,
+    /// unchanged since its last upload, is uploaded again (the run held the other's texels).
+    #[test]
+    fn an_uncovered_texture_whose_run_held_another_meanwhile_is_uploaded_again() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        unsafe {
+            let dev = super::super::real::device_raw();
+            let pc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 512, Height: 512, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+            let console = console_desc(3, 512, 512, 1, 1, DXGI_FORMAT_R8_UNORM.0 as u32, 1);
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_at = |va: usize| {
+                let mut p = std::ptr::null_mut();
+                let hr = super::super::vram::place_pages(dev, va, &pc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(512 * 512), riid, &mut p);
+                (hr.is_some_and(|hr| hr >= 0) && !p.is_null()).then(|| ID3D12Resource::from_raw(p))
+            };
+            let va = 0x66_0000_3000usize;
+            let Some(a) = place_at(va) else { return crate::gpu::recomp::runner::skip_test("no block heaps") };
+            let Some(run) = super::super::vram::block_run_of(a.as_raw() as usize) else { return crate::gpu::recomp::runner::skip_test("no block heaps") };
+            let (ka, b) = (a.as_raw() as usize, place_at(va + 0x2_0000).unwrap());
+            let kb = b.as_raw() as usize;
+            register(dev, a.as_raw(), va, &console, D3D12_RESOURCE_STATE_COMMON).unwrap();
+            {
+                // uploaded once already, from memory that does not change
+                let mut t = TEXTURES.lock().unwrap();
+                let e = t.get_mut(ka).unwrap();
+                if e.pending {
+                    e.pending = false;
+                    PENDING.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+            LAST_CONTENT.lock().unwrap().insert(ka, 7);
+            // b over the second half of a: a gives its run back
+            register(dev, b.as_raw(), va + 0x2_0000, &console, D3D12_RESOURCE_STATE_COMMON).unwrap();
+            super::super::vram::cool_blocks_for_test();
+            // d elsewhere takes the cooled run, then is released (in the order `real.rs` does)
+            let d = place_at(0x67_0000_3000).unwrap();
+            assert_eq!(super::super::vram::block_run_of(d.as_raw() as usize), Some(run), "the cooled run went to d");
+            super::super::vram::forget(d.as_raw() as usize);
+            drop(d);
+            super::super::vram::forget(kb);
+            forget(kb);
+            assert_eq!(super::super::vram::block_run_of(ka), Some(run), "a holds its run again");
+            let t = TEXTURES.lock().unwrap();
+            let e = t.by_res.get(&ka).expect("a is active again");
+            assert!(e.pending && !e.gpu_written, "a is uploaded");
+            drop(t);
+            assert!(!LAST_CONTENT.lock().unwrap().contains_key(&ka), "not left out as unchanged");
+            for r in [&a, &b] {
+                forget(r.as_raw() as usize);
+                super::super::vram::forget(r.as_raw() as usize);
+            }
+        }
+    }
+
+    /// A placed texture uncovered whose memory cannot be mapped again now (here: not one the
+    /// pages or the block heaps know) stays pending, to be uploaded once it is mapped; only one
+    /// whose block-heap run went to another texture is left alone.
+    #[test]
+    fn an_uncovered_texture_that_cannot_be_mapped_now_stays_pending() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        unsafe {
+            let p = super::super::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&p).unwrap();
+            let pc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 512, Height: 512, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+            let committed = || {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &pc, D3D12_RESOURCE_STATE_COMMON, None, &mut r).unwrap();
+                r.unwrap()
+            };
+            let (a, b) = (committed(), committed());
+            let (ka, kb) = (a.as_raw() as usize, b.as_raw() as usize);
+            let tex = Arc::new(xg::Texture::new(&console_desc(3, 512, 512, 1, 1, DXGI_FORMAT_R8_UNORM.0 as u32, 1)).unwrap());
+            let va = 0x69_0000_0000usize;
+            let entry = |va: usize| Entry { device: p as usize, va, src: va, in_gpu_view: false, tex: Arc::clone(&tex), states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: true, unmapped: false, seq: 0 };
+            {
+                let mut t = TEXTURES.lock().unwrap();
+                let (d, _) = t.insert(ka, entry(va));
+                adjust_pending(d);
+                // b over the second half of a: a is superseded, its memory unmapped
+                let (d, unmap) = t.insert(kb, entry(va + 0x2_0000));
+                adjust_pending(d);
+                assert_eq!(unmap, vec![ka]);
+                TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+            }
+            forget(kb);
+            let t = TEXTURES.lock().unwrap();
+            let e = t.by_res.get(&ka).expect("a is active again");
+            assert!(e.pending && !e.gpu_written, "a is uploaded once it is mapped, not given up");
+            drop(t);
+            forget(ka);
+        }
+    }
+
     /// Real uploads, dirty-page detection and a source changing after registration:
     /// bookkeeping alone cannot show that the bytes the GPU sees follow the mirror.
     #[test]
@@ -1595,6 +1794,26 @@ mod tests {
         d
     }
 
+    /// The race between uncovering and the next refresh: a texture uncovered while its memory is
+    /// not mapped again yet (its run may be another texture's) is active but not uploaded – not
+    /// even when its memory was written – until `forget` has remapped it and decided.
+    #[test]
+    fn an_uncovered_texture_is_not_uploaded_before_it_is_mapped_again() {
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 128, 128, 1, 1, 28, 0x105)).unwrap());
+        let entry = |va: usize| Entry { device: 0, va, src: va, in_gpu_view: false, tex: Arc::clone(&tex), states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: true, unmapped: false, seq: 0 };
+        let mut tbl = Table::new();
+        tbl.insert(1, entry(0x30_0000));
+        assert_eq!(tbl.insert(2, entry(0x30_8000)), (0, vec![1]), "a superseded by b over its second half");
+        let (_, delta, remap) = tbl.remove(2);
+        assert_eq!((delta, remap), (0, vec![1]));
+        let e = &tbl.by_res[&1];
+        assert!(e.unmapped && !e.pending, "active again, its memory not mapped yet");
+        let dirty: Vec<usize> = (0x30_0000..0x31_0000).step_by(0x1000).collect();
+        assert!(!wants_upload(e, &dirty, 0x1000), "a written page does not upload it yet");
+        let mapped = Entry { unmapped: false, ..entry(0x30_0000) };
+        assert!(wants_upload(&mapped, &dirty, 0x1000), "once mapped, a written page uploads it");
+    }
+
     /// Overlapping textures shadow earlier ones so dead placements never re-upload over shared
     /// `vram::Pages` tiles; different-range overlaps request unmapping while exact same-range
     /// overlaps stay mapped; releasing a newer placement reactivates uncovered older ones.
@@ -1630,11 +1849,14 @@ mod tests {
         unmap.sort_unstable();
         assert_eq!((delta, unmap), (0, vec![1, 2, 20]));
         assert!(tbl.by_res.contains_key(&3) && tbl.by_res.contains_key(&4));
-        // Releasing 4 uncovers newest non-overlapping shadowed entries (1 and 20) and requests remap.
+        // Releasing 4 uncovers newest non-overlapping shadowed entries (1 and 20) and requests remap;
+        // they are not uploaded before the caller remapped them (4 was pending, 1 still is).
         let (removed, delta, mut remap) = tbl.remove(4);
         remap.sort_unstable();
-        assert_eq!((removed, delta, remap), (true, 1, vec![1, 20]));
+        assert_eq!((removed, delta, remap), (true, 0, vec![1, 20]));
         assert!(tbl.by_res.contains_key(&1) && tbl.by_res.contains_key(&20) && tbl.shadowed.contains_key(&2));
+        let all_dirty: Vec<usize> = (0x10_0000..0x12_0000).step_by(0x1000).collect();
+        assert!(tbl.by_res.values().filter(|e| e.unmapped).count() == 2 && tbl.by_res.values().all(|e| !e.unmapped || !wants_upload(e, &all_dirty, 0x1000)), "uncovered: not uploaded until remapped");
         // Releasing 20 uncovers 2; releasing middle of a 3-chain still uncovers oldest when top goes.
         let (removed, _, remap) = tbl.remove(20);
         assert_eq!((removed, remap), (true, vec![2]));
@@ -1656,6 +1878,8 @@ mod tests {
     #[test]
     fn placed_title_textures_share_vram_and_preserve_pixels() {
         let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        // the pages' sharing: sampled textures take block heaps (`vram::place_in_blocks`) otherwise
+        super::super::vram::PAGES_ONLY.with(|p| p.set(true));
         let _guard = TEST_LOCK.lock().unwrap();
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;

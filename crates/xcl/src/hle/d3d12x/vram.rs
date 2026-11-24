@@ -121,6 +121,7 @@ pub(super) fn forget(resource: usize) {
     let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
     if placed {
         forget_pages(resource);
+        forget_in_blocks(resource);
         if let Some(id) = ARENA_OF.lock().unwrap().as_mut().and_then(|m| m.remove(&resource)) {
             ARENAS.lock().unwrap().release(id, std::time::Instant::now());
         }
@@ -563,6 +564,9 @@ unsafe fn place_on_pages(
 /// unshared tiles (`extra_pages` and unshared tail pages) to the cooling pool immediately.
 pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
     let key = res.as_raw() as usize;
+    if release_in_blocks(key) {
+        return;
+    }
     let mut g = PAGES.lock().unwrap();
     let now = std::time::Instant::now();
     for pages in g.values_mut().flatten() {
@@ -580,31 +584,51 @@ pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
     }
 }
 
+/// What `remap_if_unmapped` did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Remap {
+    /// the texture has its memory (again)
+    Mapped,
+    /// not now (no device, not ours, no tiles to bind): it can be mapped later
+    Failed,
+    /// its block-heap run went to another texture: it stays placed there, aliasing that one
+    RunTaken,
+}
+
 /// Re-map a previously unmapped placed texture when the newer placement shadowing it is released.
-pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
+pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> Remap {
+    if let Some(back) = retake_in_blocks(res.as_raw() as usize) {
+        if !back {
+            return Remap::RunTaken;
+        }
+        // a run found cooled or free may have held another texture meanwhile (taken and given
+        // back again): the title's unchanged memory is uploaded into it again
+        super::title_textures::forget_content(res.as_raw() as usize);
+        return Remap::Mapped;
+    }
     let mut dev: Option<ID3D12Device> = None;
     if res.GetDevice(&mut dev).is_err() {
-        return false;
+        return Remap::Failed;
     }
-    let Some(dev) = dev else { return false };
+    let Some(dev) = dev else { return Remap::Failed };
     let key = res.as_raw() as usize;
     let mut g = PAGES.lock().unwrap();
-    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return false };
+    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return Remap::Failed };
     let Some((va, console_bytes, total, mapped)) = pages.targets.get(&key).map(|t| (t.va, t.console_bytes, t.total, t.mapped)) else {
-        return false;
+        return Remap::Failed;
     };
     if mapped {
-        return true;
+        return Remap::Mapped;
     }
     let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total) else {
-        return false;
+        return Remap::Failed;
     };
     if let Some(t) = pages.targets.get_mut(&key) {
         t.used = used;
         t.used_extra = used_extra;
         t.mapped = true;
     }
-    true
+    Remap::Mapped
 }
 
 /// A resource released: its pages are no longer its.
@@ -646,10 +670,12 @@ pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
     ((p.pages.len() + p.extra_pages.len()) * PAGE, p.pools.len() * POOL_PAGES as usize * PAGE)
 }
 
-/// (bytes of pages in use by tiled textures, bytes of pool heaps) – `XCL_ACTIVITY`
+/// (bytes of pages in use by tiled textures and of block-heap runs, bytes of pool and block
+/// heaps) – `XCL_ACTIVITY`
 pub fn page_bytes() -> (usize, usize) {
+    let blocks = block_bytes();
     let g = PAGES.lock().unwrap();
-    g.values().flatten().fold((0, 0), |(used, pools), p| {
+    g.values().flatten().fold(blocks, |(used, pools), p| {
         (used + (p.pages.len() + p.extra_pages.len()) * PAGE, pools + p.pools.len() * POOL_PAGES as usize * PAGE)
     })
 }
@@ -678,23 +704,22 @@ pub unsafe fn place_pages(
     if !tier2(dev) || std::env::var_os("XCL_VRAM_ARENAS").is_some() {
         return None;
     }
+    if let Some(hr) = place_in_blocks(dev, this, va, desc, state, clear, riid, ppv) {
+        return Some(hr);
+    }
     place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, riid, ppv)
 }
 
 /// tiles (64 KiB) of a block heap (64 MiB)
-#[cfg_attr(not(test), allow(dead_code))]
 const BLOCK_TILES: usize = 1024;
 /// a run given back is not reused before this: as long as a page waits (`IDLE`, then `COOL`)
 /// before another texture gets it – the GPU may still be at work on what the title released
-#[cfg_attr(not(test), allow(dead_code))]
 const BLOCK_COOL: std::time::Duration = std::time::Duration::from_secs(4);
 /// after a block heap could not be made, no new one is tried for this long (the textures take
 /// pages meanwhile)
-#[cfg_attr(not(test), allow(dead_code))]
 const HEAP_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A run of tiles of the block heaps, shared by the textures placed at one address with one size.
-#[cfg_attr(not(test), allow(dead_code))]
 struct Run {
     heap: usize,
     first: usize,
@@ -702,7 +727,6 @@ struct Run {
 }
 
 /// A texture in the block heaps: its address and tiles, its run, whether it holds the run.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy)]
 struct InBlocks {
     va: usize,
@@ -714,7 +738,6 @@ struct InBlocks {
 
 /// The block heaps of a device and the runs of tiles in them, apart from D3D12 (`H`: the heap;
 /// numbers in the tests).
-#[cfg_attr(not(test), allow(dead_code))]
 struct Blocks<H> {
     heaps: Vec<H>,
     /// tiles handed out of the last heap
@@ -732,7 +755,6 @@ struct Blocks<H> {
     no_heap_until: Option<std::time::Instant>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl<H> Blocks<H> {
     fn new() -> Self {
         Blocks { heaps: Vec::new(), tail: 0, free: Default::default(), cooling: Default::default(), runs: Default::default(), textures: Default::default(), used: 0, no_heap_until: None }
@@ -851,9 +873,143 @@ impl<H> Blocks<H> {
 
 /// The tiles a texture the PC places in `bytes` aligned to `align` takes in the block heaps
 /// (None: none – nothing, more than a heap, or aligned to more than a tile, as MSAA is).
-#[cfg_attr(not(test), allow(dead_code))]
 fn block_tiles(bytes: u64, align: u64) -> Option<usize> {
     (bytes > 0 && bytes <= (BLOCK_TILES * PAGE) as u64 && align > 0 && PAGE as u64 % align == 0).then(|| (bytes as usize).div_ceil(PAGE))
+}
+
+// D3D12 heaps are free-threaded
+unsafe impl Send for Blocks<ID3D12Heap> {}
+
+#[cfg(test)]
+thread_local! {
+    /// tests of the pages: this thread's sampled textures take them, not the block heaps
+    pub(super) static PAGES_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// device raw pointer → its block heaps
+static BLOCKS: Mutex<std::collections::BTreeMap<usize, Blocks<ID3D12Heap>>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// A block heap (64 MiB of video memory for sampled textures).
+unsafe fn block_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
+    let desc = D3D12_HEAP_DESC {
+        SizeInBytes: (BLOCK_TILES * PAGE) as u64,
+        Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+        Alignment: 0,
+        Flags: D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES,
+    };
+    let mut heap: Option<ID3D12Heap> = None;
+    if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            crate::xlog_warn!("D3D12.X: no video memory for a block heap of sampled textures ({e}): they take pages ({n} times so far; tried again after {} s)", HEAP_BACKOFF.as_secs());
+        }
+        return None;
+    }
+    heap
+}
+
+/// A sampled texture at `va` as a placed resource in a run of tiles of the block heaps, not a
+/// reserved one on the pages. Under vkd3d-proton a reserved texture is a Vulkan sparse image,
+/// and on NVIDIA's Linux driver making one costs a kernel call that grows with the sparse images
+/// alive (0.1 ms at 10 000, 1.5–4 ms at 60 000; a placed texture 1.4 us at any count): a retail
+/// game keeps ~60 000 streamed textures alive while it loads its world and spent 1–1.9 s of every
+/// 2 s making them (#1268). Most of them sit at 4 KiB-aligned addresses, where the PC cannot
+/// place them at their address's offset in a heap standing for the title's addresses, so the run
+/// is anywhere: textures at one address with one size share it (as they shared pages), and a
+/// texture superseded by a newer one over its memory (`title_textures`, `unmap_superseded`) gives
+/// it back, so the runs follow the textures in use as the pages do. None: not placed here.
+#[allow(clippy::too_many_arguments)]
+unsafe fn place_in_blocks(
+    dev: &ID3D12Device,
+    this: *mut c_void,
+    va: usize,
+    desc: &D3D12_RESOURCE_DESC,
+    state: u32,
+    clear: *const c_void,
+    riid: *const windows_sys::core::GUID,
+    ppv: *mut *mut c_void,
+) -> Option<HRESULT> {
+    if !takes_blocks(desc) {
+        return None;
+    }
+    #[cfg(test)]
+    if PAGES_ONLY.with(|p| p.get()) {
+        return None;
+    }
+    let info = dev.GetResourceAllocationInfo(0, &[*desc]);
+    let tiles = block_tiles(info.SizeInBytes, info.Alignment)?;
+    let now = std::time::Instant::now();
+    let key = dev.as_raw() as usize;
+    // the run is taken under the lock, the texture made outside it (other threads' textures are
+    // made meanwhile); the run counts this texture from here on
+    let (heap_obj, heap, first) = {
+        let mut g = BLOCKS.lock().unwrap();
+        let b = g.entry(key).or_insert_with(Blocks::new);
+        let (heap, first) = b.take(va, tiles, now, || block_heap(dev))?;
+        (b.heaps[heap].clone(), heap, first)
+    };
+    let hr = super::real::dev_create_placed_resource(this, heap_obj.as_raw() as usize, first * PAGE, desc as *const _ as usize, state as usize, clear as usize, riid, ppv);
+    let mut g = BLOCKS.lock().unwrap();
+    let b = g.get_mut(&key)?;
+    if hr < 0 || (*ppv).is_null() {
+        b.give_back(va, tiles, now);
+        return None;
+    }
+    b.textures.insert(*ppv as usize, InBlocks { va, tiles, heap, first, held: true });
+    drop(g);
+    // aliased by address like the pages' textures
+    PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    Some(hr)
+}
+
+/// Whether a sampled texture goes in the block heaps: only in the layout the driver picks.
+fn takes_blocks(desc: &D3D12_RESOURCE_DESC) -> bool {
+    desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN
+}
+
+/// A texture of the block heaps superseded (true) or not one of them.
+fn release_in_blocks(res: usize) -> bool {
+    let mut g = BLOCKS.lock().unwrap();
+    let b = g.values_mut().find(|b| b.textures.contains_key(&res));
+    b.map(|b| b.release(res, std::time::Instant::now())).is_some()
+}
+
+/// A texture of the block heaps uncovered: whether it holds its run again (None: not one of them).
+fn retake_in_blocks(res: usize) -> Option<bool> {
+    let mut g = BLOCKS.lock().unwrap();
+    g.values_mut().find(|b| b.textures.contains_key(&res)).map(|b| b.retake(res))
+}
+
+/// A released texture gives its run back.
+fn forget_in_blocks(res: usize) {
+    let mut g = BLOCKS.lock().unwrap();
+    if let Some(b) = g.values_mut().find(|b| b.textures.contains_key(&res)) {
+        b.release(res, std::time::Instant::now());
+        b.textures.remove(&res);
+    }
+}
+
+/// The run of a texture of the block heaps: (heap, first tile).
+#[cfg(test)]
+pub(super) fn block_run_of(res: usize) -> Option<(usize, usize)> {
+    BLOCKS.lock().unwrap().values().find_map(|b| b.textures.get(&res).filter(|t| t.held).map(|t| (t.heap, t.first)))
+}
+
+/// Tests: the runs given back so far are cooled (as if their time had passed).
+#[cfg(test)]
+pub(super) fn cool_blocks_for_test() {
+    for b in BLOCKS.lock().unwrap().values_mut() {
+        for c in b.cooling.iter_mut() {
+            c.3 = c.3.checked_sub(BLOCK_COOL).unwrap_or(c.3);
+        }
+    }
+}
+
+/// (bytes of runs in use, bytes of block heaps)
+fn block_bytes() -> (usize, usize) {
+    let g = BLOCKS.lock().unwrap();
+    g.values().fold((0, 0), |(used, all), b| (used + b.used * PAGE, all + b.heaps.len() * BLOCK_TILES * PAGE))
 }
 
 /// A GPU-owned texture of the title at `va` (`desc`: the PC description, `console_bytes` its
@@ -1024,6 +1180,117 @@ mod tests {
         assert_eq!(block_tiles(4 * MIB as u64, 4 * MIB as u64), None, "MSAA: 4 MiB aligned");
         assert_eq!(block_tiles(0, PAGE as u64), None);
         assert_eq!(block_tiles(u64::MAX, PAGE as u64), None);
+    }
+
+    /// On the GPU: sampled textures at 4 KiB-aligned addresses and a cube take the block heaps, not
+    /// pages; a second texture at an address with the same size shares its run; neighbours keep
+    /// their own texels; a superseded texture gives its run back and gets it again.
+    #[test]
+    fn sampled_textures_take_block_heaps_not_pages() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let sample = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
+            // 512x512 RGBA8, one level (1 MiB), and a 64x64 cube with mips
+            let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 512, Height: 512, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: sample, ..Default::default() };
+            let cube = D3D12_RESOURCE_DESC { Width: 64, Height: 64, DepthOrArraySize: 6, MipLevels: 7, ..desc };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_at = |va: usize, d: &D3D12_RESOURCE_DESC| {
+                let mut p = std::ptr::null_mut();
+                let hr = place_pages(dev.as_raw(), va, d, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32, std::ptr::null(), Some(MIB as u64), riid, &mut p);
+                (hr.is_some_and(|hr| hr >= 0) && !p.is_null()).then(|| ID3D12Resource::from_raw(p)).expect("texture")
+            };
+            let key = dev.as_raw() as usize;
+            let held = |r: &ID3D12Resource| BLOCKS.lock().unwrap().get(&key).and_then(|b| b.textures.get(&(r.as_raw() as usize)).map(|t| t.held));
+            let pages0 = page_bytes_for(key).0;
+            let base = 0x5a_0000_3000usize;
+            let textures: Vec<ID3D12Resource> = (0..4).map(|k| place_at(base + k * MIB, &desc)).collect();
+            let c = place_at(base + 8 * MIB, &cube);
+            assert!(textures.iter().chain([&c]).all(|t| held(t) == Some(true) && is_placed_texture(t.as_raw() as usize)), "in the block heaps, aliased by address");
+            assert_eq!(page_bytes_for(key).0, pages0, "no pages");
+            let again = place_at(base, &desc);
+            let run = |r: &ID3D12Resource| BLOCKS.lock().unwrap()[&key].textures[&(r.as_raw() as usize)].first;
+            assert_eq!(run(&again), run(&textures[0]), "the same address and size: the same run");
+
+            // copies into two neighbours, read back (the texture placed again is not read through:
+            // placed textures in UNKNOWN layout inherit no contents from one another in D3D12)
+            let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut total = 0u64;
+            dev.GetCopyableFootprints(&desc, 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
+            let buffer = |t: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| {
+                let d = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: 3 * total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: sample, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: t, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &d, state, None, &mut r).unwrap();
+                r.unwrap()
+            };
+            let (upload, readback) = (buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ), buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST));
+            let mut p = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut p)).unwrap();
+            for k in 0..2usize {
+                std::slice::from_raw_parts_mut((p as *mut u8).add(k * total as usize), total as usize).fill(0x11 * (k as u8 + 1));
+            }
+            upload.Unmap(0, None);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let loc = |r: &ID3D12Resource, offset: u64| D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: offset, ..fp } } };
+            let sub = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+            for k in 0..2 {
+                list.CopyTextureRegion(&sub(&textures[k]), 0, 0, 0, &loc(&upload, k as u64 * total), None);
+            }
+            let barrier = |r: &ID3D12Resource| {
+                let t = D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(r), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, StateBefore: D3D12_RESOURCE_STATE_COPY_DEST, StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE };
+                D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(t) }, ..Default::default() }
+            };
+            list.ResourceBarrier(&[barrier(&textures[0]), barrier(&textures[1])]);
+            for (k, t) in [&textures[0], &textures[1]].into_iter().enumerate() {
+                list.CopyTextureRegion(&loc(&readback, k as u64 * total), 0, 0, 0, &sub(t), None);
+            }
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&fence, 1).unwrap();
+            let t = std::time::Instant::now();
+            while fence.GetCompletedValue() < 1 && t.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(fence.GetCompletedValue(), 1, "GPU work did not finish");
+            readback.Map(0, None, Some(&mut p)).unwrap();
+            for (k, want) in [0x11u8, 0x22].into_iter().enumerate() {
+                let row = std::slice::from_raw_parts((p as *const u8).add(k * total as usize), 512 * 4);
+                assert!(row.iter().all(|&b| b == want), "copy {k} read back {:02x?}", &row[..16]);
+            }
+            readback.Unmap(0, None);
+
+            // superseded: the run goes back (and comes back while nobody took it); released: gone
+            unmap_superseded(&textures[1]);
+            assert_eq!(held(&textures[1]), Some(false));
+            assert!(remap_if_unmapped(&textures[1]) == Remap::Mapped && held(&textures[1]) == Some(true));
+            for t in textures.iter().chain([&c, &again]) {
+                forget(t.as_raw() as usize);
+                assert_eq!(held(t), None);
+            }
+        }
+    }
+
+    /// Only textures in the layout the driver picks take the block heaps.
+    #[test]
+    fn textures_in_a_layout_of_their_own_keep_the_pages() {
+        let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 512, Height: 512, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+        assert!(takes_blocks(&desc));
+        assert!(!takes_blocks(&D3D12_RESOURCE_DESC { Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, ..desc }));
     }
 
     /// One call per heap: its tiles in runs, the other heaps' skipped.
