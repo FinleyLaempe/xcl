@@ -681,6 +681,181 @@ pub unsafe fn place_pages(
     place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, riid, ppv)
 }
 
+/// tiles (64 KiB) of a block heap (64 MiB)
+#[cfg_attr(not(test), allow(dead_code))]
+const BLOCK_TILES: usize = 1024;
+/// a run given back is not reused before this: as long as a page waits (`IDLE`, then `COOL`)
+/// before another texture gets it – the GPU may still be at work on what the title released
+#[cfg_attr(not(test), allow(dead_code))]
+const BLOCK_COOL: std::time::Duration = std::time::Duration::from_secs(4);
+/// after a block heap could not be made, no new one is tried for this long (the textures take
+/// pages meanwhile)
+#[cfg_attr(not(test), allow(dead_code))]
+const HEAP_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A run of tiles of the block heaps, shared by the textures placed at one address with one size.
+#[cfg_attr(not(test), allow(dead_code))]
+struct Run {
+    heap: usize,
+    first: usize,
+    users: u32,
+}
+
+/// A texture in the block heaps: its address and tiles, its run, whether it holds the run.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy)]
+struct InBlocks {
+    va: usize,
+    tiles: usize,
+    heap: usize,
+    first: usize,
+    held: bool,
+}
+
+/// The block heaps of a device and the runs of tiles in them, apart from D3D12 (`H`: the heap;
+/// numbers in the tests).
+#[cfg_attr(not(test), allow(dead_code))]
+struct Blocks<H> {
+    heaps: Vec<H>,
+    /// tiles handed out of the last heap
+    tail: usize,
+    /// cooled runs by length: (heap, first tile)
+    free: std::collections::BTreeMap<usize, Vec<(usize, usize)>>,
+    /// runs given back, reusable after `BLOCK_COOL`: (heap, first tile, tiles, when)
+    cooling: std::collections::VecDeque<(usize, usize, usize, std::time::Instant)>,
+    /// (address, tiles) → its run
+    runs: std::collections::HashMap<(usize, usize), Run>,
+    textures: std::collections::HashMap<usize, InBlocks>,
+    /// tiles in runs
+    used: usize,
+    /// no new heap is tried before this (one could not be made)
+    no_heap_until: Option<std::time::Instant>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl<H> Blocks<H> {
+    fn new() -> Self {
+        Blocks { heaps: Vec::new(), tail: 0, free: Default::default(), cooling: Default::default(), runs: Default::default(), textures: Default::default(), used: 0, no_heap_until: None }
+    }
+
+    /// `n` free tiles: a cooled run (the rest of a longer one stays free), else the next tiles of
+    /// the last heap, else a new heap from `make` (None: no heap; then none is tried again for
+    /// `HEAP_BACKOFF`).
+    fn alloc(&mut self, n: usize, now: std::time::Instant, make: impl FnOnce() -> Option<H>) -> Option<(usize, usize)> {
+        while self.cooling.front().is_some_and(|c| now.duration_since(c.3) >= BLOCK_COOL) {
+            let (heap, first, len, _) = self.cooling.pop_front()?;
+            self.free.entry(len).or_default().push((heap, first));
+        }
+        if let Some(len) = self.free.range(n..).find(|(_, v)| !v.is_empty()).map(|(&len, _)| len) {
+            let runs = self.free.get_mut(&len)?;
+            let (heap, first) = runs.pop()?;
+            if runs.is_empty() {
+                self.free.remove(&len);
+            }
+            if len > n {
+                self.free.entry(len - n).or_default().push((heap, first + n));
+            }
+            return Some((heap, first));
+        }
+        if self.heaps.is_empty() || self.tail + n > BLOCK_TILES {
+            if self.no_heap_until.is_some_and(|t| now < t) {
+                return None;
+            }
+            let Some(heap) = make() else {
+                self.no_heap_until = Some(now + HEAP_BACKOFF);
+                return None;
+            };
+            if self.tail < BLOCK_TILES && !self.heaps.is_empty() {
+                self.free.entry(BLOCK_TILES - self.tail).or_default().push((self.heaps.len() - 1, self.tail));
+            }
+            self.heaps.push(heap);
+            self.tail = 0;
+        }
+        self.tail += n;
+        Some((self.heaps.len() - 1, self.tail - n))
+    }
+
+    /// The run of one more texture of `n` tiles at `va`: (heap, first tile).
+    fn take(&mut self, va: usize, n: usize, now: std::time::Instant, make: impl FnOnce() -> Option<H>) -> Option<(usize, usize)> {
+        if let Some(r) = self.runs.get_mut(&(va, n)) {
+            r.users += 1;
+            return Some((r.heap, r.first));
+        }
+        let (heap, first) = self.alloc(n, now, make)?;
+        self.runs.insert((va, n), Run { heap, first, users: 1 });
+        self.used += n;
+        Some((heap, first))
+    }
+
+    /// One texture of `n` tiles at `va` fewer: the run cools once none is left.
+    fn give_back(&mut self, va: usize, n: usize, now: std::time::Instant) {
+        let Some(r) = self.runs.get_mut(&(va, n)) else { return };
+        r.users -= 1;
+        if r.users == 0 {
+            let r = self.runs.remove(&(va, n)).unwrap();
+            self.cooling.push_back((r.heap, r.first, n, now));
+            self.used -= n;
+        }
+    }
+
+    /// Texture `res` superseded or released: it gives its run back.
+    fn release(&mut self, res: usize, now: std::time::Instant) {
+        if let Some(t) = self.textures.get_mut(&res).filter(|t| t.held) {
+            t.held = false;
+            let t = *t;
+            self.give_back(t.va, t.tiles, now);
+        }
+    }
+
+    /// Texture `res` uncovered: whether it holds its run again – not when another texture took the
+    /// run meanwhile (it is still placed there).
+    fn retake(&mut self, res: usize) -> bool {
+        let Some(t) = self.textures.get(&res).copied() else { return false };
+        if t.held {
+            return true;
+        }
+        let back = match self.runs.get_mut(&(t.va, t.tiles)) {
+            Some(r) if (r.heap, r.first) == (t.heap, t.first) => {
+                r.users += 1;
+                true
+            }
+            Some(_) => false,
+            None => {
+                let cooling = self.cooling.iter().position(|c| (c.0, c.1, c.2) == (t.heap, t.first, t.tiles));
+                let free = self.free.get(&t.tiles).and_then(|v| v.iter().position(|&f| f == (t.heap, t.first)));
+                let found = match (cooling, free) {
+                    (Some(i), _) => self.cooling.remove(i).is_some(),
+                    (None, Some(i)) => {
+                        let runs = self.free.get_mut(&t.tiles).unwrap();
+                        runs.swap_remove(i);
+                        if runs.is_empty() {
+                            self.free.remove(&t.tiles);
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+                if found {
+                    self.runs.insert((t.va, t.tiles), Run { heap: t.heap, first: t.first, users: 1 });
+                    self.used += t.tiles;
+                }
+                found
+            }
+        };
+        if back {
+            self.textures.insert(res, InBlocks { held: true, ..t });
+        }
+        back
+    }
+}
+
+/// The tiles a texture the PC places in `bytes` aligned to `align` takes in the block heaps
+/// (None: none – nothing, more than a heap, or aligned to more than a tile, as MSAA is).
+#[cfg_attr(not(test), allow(dead_code))]
+fn block_tiles(bytes: u64, align: u64) -> Option<usize> {
+    (bytes > 0 && bytes <= (BLOCK_TILES * PAGE) as u64 && align > 0 && PAGE as u64 % align == 0).then(|| (bytes as usize).div_ceil(PAGE))
+}
+
 /// A GPU-owned texture of the title at `va` (`desc`: the PC description, `console_bytes` its
 /// size on the console): on the title's pages there, else in the arena for that address (None:
 /// neither – the caller makes a resource of its own).
@@ -718,6 +893,138 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const MIB: usize = 1 << 20;
+
+    /// Runs of the block heaps: one per (address, tiles), shared there; a run given back is
+    /// reused after `BLOCK_COOL` (a longer one split), not after the pages' `COOL` alone, a heap's
+    /// end left over is reused, and a new heap comes when nothing fits.
+    #[test]
+    fn block_runs_are_shared_by_address_and_reused_after_cooling() {
+        let (t, a0) = (Instant::now(), 0x40_0000_1000usize);
+        let mut b: Blocks<u32> = Blocks::new();
+        let mut n = 0u32;
+        let mut make = || {
+            n += 1;
+            Some(n - 1)
+        };
+        assert_eq!(b.take(a0, 3, t, &mut make), Some((0, 0)));
+        assert_eq!(b.take(a0, 3, t, &mut make), Some((0, 0)), "the same address and size: the same run");
+        assert_eq!(b.take(a0, 4, t, &mut make), Some((0, 3)), "another size: a run of its own");
+        assert_eq!(b.take(a0 + 0x1000, 3, t, &mut make), Some((0, 7)), "another address: a run of its own");
+        assert_eq!(b.used, 10);
+        b.give_back(a0, 3, t);
+        assert_eq!(b.used, 10, "still used by the other texture there");
+        b.give_back(a0, 3, t);
+        b.give_back(a0, 4, t);
+        assert_eq!(b.take(a0 + 0x2000, 2, t + COOL, &mut make), Some((0, 10)), "not reused before BLOCK_COOL");
+        // cooled: runs of 3 at 0 and 4 at 3
+        assert_eq!(b.take(a0 + 0x3000, 2, t + BLOCK_COOL, &mut make), Some((0, 0)), "the shortest cooled run that fits, split");
+        assert_eq!(b.take(a0 + 0x4000, 3, t + BLOCK_COOL, &mut make), Some((0, 3)));
+        assert_eq!(b.take(a0 + 0x5000, 1, t + BLOCK_COOL, &mut make), Some((0, 6)), "the rest of a split run");
+        assert_eq!(b.take(a0 + 0x6000, BLOCK_TILES - 12, t + BLOCK_COOL, &mut make), Some((0, 12)));
+        assert_eq!(b.take(a0 + 0x7000, 2, t + BLOCK_COOL, &mut make), Some((1, 0)), "a new heap");
+        assert_eq!(b.take(a0 + 0x8000, BLOCK_TILES, t + BLOCK_COOL, || None), None, "no heap and nothing free");
+        assert_eq!(b.heaps.len(), 2);
+    }
+
+    /// A heap that cannot be made: no run (the texture takes pages), and no new heap is tried for
+    /// `HEAP_BACKOFF` – runs that fit in what is left are still handed out meanwhile; a heap filled
+    /// exactly leaves nothing over when the next one comes.
+    #[test]
+    fn no_new_block_heap_is_tried_for_a_while_after_one_could_not_be_made() {
+        let (t, a0) = (Instant::now(), 0x41_0000_0000usize);
+        let mut b: Blocks<u32> = Blocks::new();
+        let mut tries = 0;
+        assert_eq!(b.take(a0, 4, t, || { tries += 1; None }), None, "no first heap");
+        assert!(b.runs.is_empty() && b.used == 0 && b.heaps.is_empty());
+        assert_eq!(b.take(a0, 4, t + HEAP_BACKOFF / 2, || { tries += 1; Some(0) }), None, "not tried again yet");
+        assert_eq!(tries, 1);
+        assert_eq!(b.take(a0, BLOCK_TILES, t + HEAP_BACKOFF, || { tries += 1; Some(0) }), Some((0, 0)), "tried again: a whole heap");
+        assert_eq!(tries, 2);
+        let t2 = t + HEAP_BACKOFF;
+        assert_eq!(b.take(a0 + 0x1000, 1, t2, || None), None, "the next heap cannot be made");
+        b.give_back(a0, BLOCK_TILES, t2);
+        assert_eq!(b.take(a0 + 0x2000, 4, t2 + BLOCK_COOL, || panic!("no heap is tried meanwhile")), Some((0, 0)), "a cooled run that fits is still handed out");
+        assert_eq!(b.take(a0 + 0x3000, BLOCK_TILES, t2 + BLOCK_COOL, || panic!("no heap is tried meanwhile")), None, "the rest is too short, and no heap yet");
+        assert_eq!(b.take(a0 + 0x3000, BLOCK_TILES, t2 + HEAP_BACKOFF, || Some(1)), Some((1, 0)), "a new heap after the back-off");
+        assert_eq!(b.heaps, vec![0, 1]);
+        let free: Vec<_> = b.free.iter().filter(|(_, v)| !v.is_empty()).map(|(&len, v)| (len, v.clone())).collect();
+        assert_eq!(free, vec![(BLOCK_TILES - 4, vec![(0, 4)])], "only the split run's rest: nothing over from the full heap's end");
+    }
+
+    /// A superseded texture gives its run back and gets it again when uncovered – unless another
+    /// texture took the run meanwhile; a second texture at the address keeps the run meanwhile.
+    #[test]
+    fn a_superseded_texture_gets_its_run_back_unless_another_took_it() {
+        let (t, a0) = (Instant::now(), 0x40_0000_0000usize);
+        let mut b: Blocks<u32> = Blocks::new();
+        let place = |b: &mut Blocks<u32>, res: usize, va: usize, n: usize, now: Instant| {
+            let (heap, first) = b.take(va, n, now, || Some(0)).unwrap();
+            b.textures.insert(res, InBlocks { va, tiles: n, heap, first, held: true });
+            (heap, first)
+        };
+        let run = place(&mut b, 1, a0, 4, t);
+        b.release(1, t);
+        assert!(b.retake(1) && b.runs[&(a0, 4)].users == 1, "uncovered within BLOCK_COOL: its run");
+        place(&mut b, 2, a0, 4, t);
+        b.release(1, t);
+        assert_eq!(b.runs[&(a0, 4)].users, 1, "the other texture there keeps the run");
+        assert!(b.retake(1) && b.runs[&(a0, 4)].users == 2);
+        b.release(1, t);
+        b.release(2, t);
+        assert!(!b.runs.contains_key(&(a0, 4)) && b.used == 0);
+        assert_eq!(place(&mut b, 3, a0 + PAGE, 4, t + BLOCK_COOL), run, "the cooled run goes to another texture");
+        assert!(!b.retake(1), "taken: no run to get back");
+        assert!(!b.textures[&1].held && b.retake(3));
+    }
+
+    /// A run given back and cooled into the free runs is got back by its texture when nobody took
+    /// it; once a shorter texture took its front, the texture does not get it, and what is free
+    /// stays as it was. Unknown textures and runs, and a second release, change nothing.
+    #[test]
+    fn retake_finds_a_free_run_and_leaves_a_split_one() {
+        let (t, a0) = (Instant::now(), 0x42_0000_0000usize);
+        let mut b: Blocks<u32> = Blocks::new();
+        let place = |b: &mut Blocks<u32>, res: usize, va: usize, n: usize, now: Instant| {
+            let (heap, first) = b.take(va, n, now, || Some(0)).unwrap();
+            b.textures.insert(res, InBlocks { va, tiles: n, heap, first, held: true });
+            (heap, first)
+        };
+        let run = place(&mut b, 1, a0, 4, t);
+        place(&mut b, 2, a0 + PAGE, 2, t);
+        b.release(1, t);
+        b.release(1, t);
+        b.give_back(a0 + 3 * PAGE, 4, t);
+        b.release(99, t);
+        assert_eq!(b.used, 2, "a second release and unknown ones change nothing");
+        // cooled into the free runs (an allocation too long for it moves them there)
+        place(&mut b, 3, a0 + 2 * PAGE, 5, t + BLOCK_COOL);
+        assert!(b.cooling.is_empty() && b.free.get(&4).is_some_and(|v| v.contains(&run)), "a's run is free");
+        assert!(!b.retake(99), "an unknown texture");
+        assert!(b.retake(1), "nobody took it: a gets it back from the free runs");
+        assert_eq!((b.runs[&(a0, 4)].heap, b.runs[&(a0, 4)].first), run);
+        assert_eq!(b.used, 11);
+        assert!(b.free.values().all(|v| !v.contains(&run)), "no longer free");
+        assert!(b.free.values().all(|v| !v.is_empty()), "no length is kept without a run");
+        // given back again, cooled, and a shorter texture takes its front
+        b.release(1, t + BLOCK_COOL);
+        assert_eq!(place(&mut b, 4, a0 + 4 * PAGE, 3, t + 2 * BLOCK_COOL), run, "the run split");
+        let free_before = b.free.clone();
+        assert!(!b.retake(1), "its front is another texture's");
+        assert_eq!(b.free, free_before, "the free runs are as they were");
+        assert!(!b.textures[&1].held && b.used == 10);
+    }
+
+    /// Any texture up to a heap whose PC alignment is at most a tile takes the block heaps.
+    #[test]
+    fn block_tiles_take_textures_up_to_a_heap_aligned_to_a_tile_or_less() {
+        assert_eq!(block_tiles(0x1_6000, PAGE as u64), Some(2));
+        assert_eq!(block_tiles(0x1000, 0x1000), Some(1));
+        assert_eq!(block_tiles((BLOCK_TILES * PAGE) as u64, PAGE as u64), Some(BLOCK_TILES));
+        assert_eq!(block_tiles((BLOCK_TILES * PAGE) as u64 + 1, PAGE as u64), None, "more than a heap");
+        assert_eq!(block_tiles(4 * MIB as u64, 4 * MIB as u64), None, "MSAA: 4 MiB aligned");
+        assert_eq!(block_tiles(0, PAGE as u64), None);
+        assert_eq!(block_tiles(u64::MAX, PAGE as u64), None);
+    }
 
     /// One call per heap: its tiles in runs, the other heaps' skipped.
     #[test]
